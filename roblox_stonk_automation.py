@@ -116,8 +116,8 @@ def _pynput_key_vk(key) -> Optional[int]:
     return None
 
 
-def _win_click_sendinput(x: int, y: int, delay_s: float) -> bool:
-    """Win32 click: SetCursorPos + mouse_event. Often registers where pynput/pyautogui do not."""
+def _win_legacy_setcursor_mouse_event(x: int, y: int, delay_s: float) -> bool:
+    """SetCursorPos + deprecated mouse_event (still useful after stronger methods fail)."""
     try:
         user32 = ctypes.windll.user32
         MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -128,6 +128,125 @@ def _win_click_sendinput(x: int, y: int, delay_s: float) -> bool:
         user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
         time.sleep(delay_s)
         user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _win_try_pydirectinput_click(x: int, y: int, delay_ms: int) -> bool:
+    """pydirectinput uses SendInput; often works where PyAutoGUI is ignored."""
+    try:
+        import pydirectinput as di  # noqa: WPS433
+
+        di.FAILSAFE = False
+        di.PAUSE = 0
+        x, y = int(round(x)), int(round(y))
+        dwell = max(0.048, float(delay_ms) / 800.0)
+        move_secs = min(0.45, max(0.15, float(delay_ms) / 450.0 + 0.12))
+        di.moveTo(x, y, duration=move_secs)
+        time.sleep(max(0.08, dwell * 1.15))
+        di.mouseDown(button="left")
+        time.sleep(max(0.058, dwell * 1.4))
+        di.mouseUp(button="left")
+        return True
+    except Exception:
+        return False
+
+
+def _win_try_sendinput_absolute_click(x: int, y: int, dwell_s: float) -> bool:
+    """
+    Formal SendInput: absolute MOVE on virtual-desktop + DOWN, pause, UP.
+    Separate bursts so the OS/game sees a realistic press duration.
+    """
+    try:
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        INPUT_MOUSE = 0
+        MOUSEEVENTF_MOVE = 0x0001
+        MOUSEEVENTF_LEFTDOWN = 0x0002
+        MOUSEEVENTF_LEFTUP = 0x0004
+        MOUSEEVENTF_ABSOLUTE = 0x8000
+        MOUSEEVENTF_VIRTUALDESK = 0x4000
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = (
+                ("dx", wintypes.LONG),
+                ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t),
+            )
+
+        class UNION(ctypes.Union):
+            _fields_ = (("mi", MOUSEINPUT),)
+
+        class INPUT(ctypes.Structure):
+            _fields_ = (("type", wintypes.DWORD), ("union", UNION))
+
+        xv = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+        yv = user32.GetSystemMetrics(77)
+        vw = max(1, user32.GetSystemMetrics(78) - 1)  # SM_CXVIRTUALSCREEN
+        vh = max(1, user32.GetSystemMetrics(79) - 1)
+        ax = int((int(round(x)) - xv) * 65535 / vw)
+        ay = int((int(round(y)) - yv) * 65535 / vh)
+        ax = max(0, min(65535, ax))
+        ay = max(0, min(65535, ay))
+
+        abs_move = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+
+        inp_m = INPUT()
+        inp_m.type = INPUT_MOUSE
+        inp_m.union.mi = MOUSEINPUT(ax, ay, 0, abs_move, 0, 0)
+
+        inp_d = INPUT()
+        inp_d.type = INPUT_MOUSE
+        inp_d.union.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, 0)
+
+        inp_u = INPUT()
+        inp_u.type = INPUT_MOUSE
+        inp_u.union.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, 0)
+
+        sz = ctypes.sizeof(INPUT)
+        if user32.SendInput(1, ctypes.pointer(inp_m), sz) != 1:
+            return False
+        time.sleep(max(0.012, dwell_s * 0.55))
+        if user32.SendInput(1, ctypes.pointer(inp_d), sz) != 1:
+            return False
+        time.sleep(max(0.055, dwell_s * 1.25))
+        if user32.SendInput(1, ctypes.pointer(inp_u), sz) != 1:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _win_try_postmessage_lclick(hwnd: Optional[int], screen_x: int, screen_y: int, dwell_s: float) -> bool:
+    """
+    Posts WM_LBUTTON* to HWND (often ignored by GPU games — last ditch).
+    Coordinates mapped with ScreenToClient for the foreground Roblox hwnd.
+    """
+    if hwnd is None:
+        return False
+    try:
+        WM_LBUTTONDOWN = 0x0201
+        WM_LBUTTONUP = 0x0202
+
+        user32 = ctypes.windll.user32
+
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        pt = POINT(int(round(screen_x)), int(round(screen_y)))
+        if not user32.ScreenToClient(hwnd, ctypes.byref(pt)):
+            pass
+        lpm = ctypes.c_long(((int(pt.y) & 0xFFFF) << 16) | (int(pt.x) & 0xFFFF)).value
+        MK_LBUTTON = 1
+
+        user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lpm)
+        time.sleep(max(0.058, dwell_s * 1.3))
+        user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lpm)
         return True
     except Exception:
         return False
@@ -966,11 +1085,21 @@ def _mouse_click(x: int, y: int, delay_ms: int = 150):
     y = int(round(y))
     d = max(0.01, float(delay_ms) / 1000.0)
 
-    if _pyautogui_move_pause_click(x, y, delay_ms):
-        return
-
     if IS_WIN:
-        if _win_click_sendinput(x, y, d):
+        dwell = max(0.035, float(delay_ms) / 1000.0)
+        hwnd = None
+        try:
+            hwnd = _win_find_roblox_hwnd()
+        except Exception:
+            pass
+        # Order: strongest for DirectX/fullscreen titles first (pydirectinput + SendInput), then gradual PyAutoGUI, then legacy/APIs.
+        if _win_try_pydirectinput_click(x, y, delay_ms):
+            return
+        if _win_try_sendinput_absolute_click(x, y, dwell):
+            return
+        if _pyautogui_move_pause_click(x, y, delay_ms):
+            return
+        if _win_legacy_setcursor_mouse_event(x, y, dwell):
             return
         try:
             pyautogui.click(x, y, clicks=1, interval=0.0, duration=0.0)
@@ -984,7 +1113,7 @@ def _mouse_click(x: int, y: int, delay_ms: int = 150):
             mc.position = (x, y)
             time.sleep(d)
             mc.press(_m.Button.left)
-            time.sleep(d)
+            time.sleep(max(0.05, d))
             mc.release(_m.Button.left)
             return
         except Exception:
@@ -992,8 +1121,10 @@ def _mouse_click(x: int, y: int, delay_ms: int = 150):
         pyautogui.moveTo(x, y, duration=0)
         time.sleep(d)
         pyautogui.mouseDown()
-        time.sleep(d)
+        time.sleep(max(0.05, d))
         pyautogui.mouseUp()
+        if _win_try_postmessage_lclick(hwnd, x, y, dwell):
+            return
         return
 
     # macOS / Linux: pynput then raw pyautogui down/up
