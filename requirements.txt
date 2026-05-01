@@ -7,3 +7,4 @@ pytesseract>=0.3.10
 numpy>=1.24.0
 pynput>=1.7.6
 pygetwindow>=0.0.9
+pydirectinput>=1.0.4 ; sys_platform == "win32"
