@@ -938,13 +938,36 @@ def ocr_read_page_indicator(region: tuple) -> Tuple[Optional[int], Optional[int]
 
 
 # ============================================================
-# IN-GAME MOUSE CLICKS (using pynput for cross-platform support)
+# IN-GAME MOUSE CLICKS
 # ============================================================
+
+def _pyautogui_move_pause_click(x: int, y: int, delay_ms: int = 150) -> bool:
+    """
+    Same pattern as common working desktop bots: smooth moveTo, brief settle, then click.
+    Instant teleports are often ignored by Windows games (DirectX / fullscreen).
+    """
+    try:
+        x = int(round(x))
+        y = int(round(y))
+        move_secs = min(0.45, max(0.15, float(delay_ms) / 450.0 + 0.12))
+        settle = max(0.12, min(0.28, float(delay_ms) / 900.0 + 0.1))
+        pyautogui.moveTo(x, y, duration=move_secs)
+        time.sleep(settle)
+        pyautogui.click()
+        return True
+    except pyautogui.FailSafeException:
+        raise
+    except Exception:
+        return False
+
 
 def _mouse_click(x: int, y: int, delay_ms: int = 150):
     x = int(round(x))
     y = int(round(y))
     d = max(0.01, float(delay_ms) / 1000.0)
+
+    if _pyautogui_move_pause_click(x, y, delay_ms):
+        return
 
     if IS_WIN:
         if _win_click_sendinput(x, y, d):
@@ -973,7 +996,7 @@ def _mouse_click(x: int, y: int, delay_ms: int = 150):
         pyautogui.mouseUp()
         return
 
-    # macOS / Linux: pynput first (your working order), then pyautogui.
+    # macOS / Linux: pynput then raw pyautogui down/up
     try:
         from pynput import mouse as _m
 
