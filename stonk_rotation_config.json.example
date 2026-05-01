@@ -1,0 +1,10 @@
+{
+  "pages_per_cycle": 12,
+  "cycle_wait_seconds": 3600,
+  "sale_caps": [50, 50, 23],
+  "offsale_universe_ids": [
+    "YOUR_UNIVERSE_ID_1",
+    "YOUR_UNIVERSE_ID_2",
+    "YOUR_UNIVERSE_ID_3"
+  ]
+}
