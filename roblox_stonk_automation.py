@@ -1,6 +1,9 @@
 """
-Roblox Stonk Automation — GUI Edition
-======================================
+Roblox Stonk Automation — GUI Edition  (Windows / GitHub canonical)
+===================================================================
+
+PRIMARY TARGET FOR THIS TREE: Windows (Win32 mouse, DPI hint, installer batch files).
+macOS CAN run this script, but maintain a separate Mac-focused copy elsewhere if paths diverge.
 
 SETUP INSTRUCTIONS:
 -------------------
@@ -37,6 +40,7 @@ import json
 import random
 import string
 import shutil
+import ctypes
 import platform
 import threading
 import subprocess
@@ -75,7 +79,97 @@ except ImportError:
 from playwright.sync_api import sync_playwright
 
 pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0.02
 IS_MAC = platform.system() == "Darwin"
+IS_WIN = platform.system() == "Windows"
+
+# Windows: use real screen pixels for coords (matches Roblox / picked points on scaled displays).
+if IS_WIN:
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+# Virtual key codes for global hotkeys (pynput + Windows).
+_VK_M = 0x4D
+_VK_N = 0x4E
+
+
+def _pynput_key_vk(key) -> Optional[int]:
+    """Letter keys on Windows often expose .vk; .char may be None when Ctrl is held."""
+    v = getattr(key, "vk", None)
+    if v is not None:
+        return int(v) & 0xFF
+    try:
+        ch = getattr(key, "char", None)
+        if ch and len(ch) == 1:
+            o = ord(ch)
+            if 97 <= o <= 122:
+                return o - 32
+            if 65 <= o <= 90:
+                return o
+    except (TypeError, AttributeError):
+        pass
+    return None
+
+
+def _win_click_sendinput(x: int, y: int, delay_s: float) -> bool:
+    """Win32 click: SetCursorPos + mouse_event. Often registers where pynput/pyautogui do not."""
+    try:
+        user32 = ctypes.windll.user32
+        MOUSEEVENTF_LEFTDOWN = 0x0002
+        MOUSEEVENTF_LEFTUP = 0x0004
+        if not user32.SetCursorPos(int(x), int(y)):
+            return False
+        time.sleep(delay_s)
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(delay_s)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _win_find_roblox_hwnd() -> Optional[int]:
+    try:
+        user32 = ctypes.windll.user32
+        found: list = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def _enum(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            n = user32.GetWindowTextLengthW(hwnd)
+            if n <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            if "Roblox" in buf.value:
+                found.append(int(hwnd))
+            return True
+
+        user32.EnumWindows(_enum, 0)
+        return found[0] if found else None
+    except Exception:
+        return None
+
+
+def _win_activate_roblox() -> bool:
+    hwnd = _win_find_roblox_hwnd()
+    if not hwnd:
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        SW_RESTORE = 9
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -851,9 +945,38 @@ def _mouse_click(x: int, y: int, delay_ms: int = 150):
     x = int(round(x))
     y = int(round(y))
     d = max(0.01, float(delay_ms) / 1000.0)
-    # Primary: pynput click (matches your working script).
+
+    if IS_WIN:
+        if _win_click_sendinput(x, y, d):
+            return
+        try:
+            pyautogui.click(x, y, clicks=1, interval=0.0, duration=0.0)
+            return
+        except Exception:
+            pass
+        try:
+            from pynput import mouse as _m
+
+            mc = _m.Controller()
+            mc.position = (x, y)
+            time.sleep(d)
+            mc.press(_m.Button.left)
+            time.sleep(d)
+            mc.release(_m.Button.left)
+            return
+        except Exception:
+            pass
+        pyautogui.moveTo(x, y, duration=0)
+        time.sleep(d)
+        pyautogui.mouseDown()
+        time.sleep(d)
+        pyautogui.mouseUp()
+        return
+
+    # macOS / Linux: pynput first (your working order), then pyautogui.
     try:
         from pynput import mouse as _m
+
         mc = _m.Controller()
         mc.position = (x, y)
         time.sleep(d)
@@ -864,7 +987,6 @@ def _mouse_click(x: int, y: int, delay_ms: int = 150):
     except Exception:
         pass
 
-    # Fallback: pyautogui click backend.
     pyautogui.moveTo(x, y, duration=0)
     time.sleep(d)
     pyautogui.mouseDown()
@@ -889,6 +1011,13 @@ def _normalize_region(region: tuple):
 
 
 def bring_roblox_to_foreground():
+    if IS_WIN:
+        try:
+            if _win_activate_roblox():
+                time.sleep(1.0)
+                return
+        except Exception:
+            pass
     if HAS_PYGETWINDOW and hasattr(gw, "getWindowsWithTitle"):
         try:
             windows = gw.getWindowsWithTitle("Roblox")
@@ -1796,23 +1925,40 @@ class StonkAutomationApp:
     # ── Hotkeys ───────────────────────────────────────────────────────────────
 
     def _setup_hotkeys(self):
-        # App-level hotkeys always available while this window is focused.
-        self.root.bind_all("<Control-n>", lambda _e: self._hotkey_toggle())
-        self.root.bind_all("<Control-m>", lambda _e: self._hotkey_stop())
-        self.root.bind_all("<Control-M>", lambda _e: self._hotkey_stop())
-        self.root.bind_all("<Command-m>", lambda _e: self._hotkey_stop())
+        def _tk_n(_e=None):
+            self._hotkey_toggle()
+            return "break"
 
-        # Global listener allows start/stop while game window is focused.
+        def _tk_m(_e=None):
+            self._hotkey_stop()
+            return "break"
+
+        # Tk: when GUI focused (bindings differ slightly by OS).
+        self.root.bind_all("<Control-n>", _tk_n)
+        self.root.bind_all("<Control-m>", _tk_m)
+        self.root.bind_all("<Control-N>", _tk_n)
+        self.root.bind_all("<Control-M>", _tk_m)
+        self.root.bind_all("<Command-n>", _tk_n)
+        self.root.bind_all("<Command-m>", _tk_m)
+        self.root.bind_all("<Command-N>", _tk_n)
+        self.root.bind_all("<Command-M>", _tk_m)
+        if IS_WIN:
+            self.root.bind_all("<Control-Key-n>", _tk_n)
+            self.root.bind_all("<Control-Key-N>", _tk_n)
+            self.root.bind_all("<Control-Key-m>", _tk_m)
+            self.root.bind_all("<Control-Key-M>", _tk_m)
+
+        # Global listener: works while Roblox or other apps are focused.
         def on_press(key):
             if key in (pynput_kb.Key.ctrl_l, pynput_kb.Key.ctrl_r):
                 self._ctrl_held = True
-            try:
-                if self._ctrl_held and key.char == 'm':
-                    self._hotkey_stop()
-                if self._ctrl_held and key.char == 'n':
-                    self._hotkey_toggle()
-            except AttributeError:
-                pass
+            if not self._ctrl_held:
+                return
+            vk = _pynput_key_vk(key)
+            if vk == _VK_M:
+                self._hotkey_stop()
+            elif vk == _VK_N:
+                self._hotkey_toggle()
 
         def on_release(key):
             if key in (pynput_kb.Key.ctrl_l, pynput_kb.Key.ctrl_r):
