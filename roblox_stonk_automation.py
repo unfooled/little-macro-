@@ -13,7 +13,7 @@ SETUP INSTRUCTIONS:
 3. Install Tesseract OCR:
    - macOS:  brew install tesseract
    - Linux:  sudo apt install tesseract-ocr
-   - Windows: https://github.com/UB-Mannheim/tesseract/wiki
+   - Windows: run install_tesseract_windows.bat, or https://github.com/UB-Mannheim/tesseract/wiki
 
 4. One-time Roblox login (saves session cookies):
    python3 roblox_stonk_automation.py --setup
@@ -36,6 +36,7 @@ import time
 import json
 import random
 import string
+import shutil
 import platform
 import threading
 import subprocess
@@ -87,8 +88,61 @@ SYMBOLS_DIR = os.path.join(BASE_DIR, "symbols")
 GAMEPASS_JS_FILE = os.path.join(BASE_DIR, "gamepass_creator.js")
 ROTATION_FILE = os.path.join(BASE_DIR, "stonk_rotation_config.json")
 ROBux_LOGO_FILE = os.path.join(BASE_DIR, "ocr_ignore_robux_logo.png")
+TESSERACT_HINT_FILE = os.path.join(BASE_DIR, "stonk_tesseract_path.txt")
 
-TESSERACT_PATH = r""   # Windows only — leave blank on macOS/Linux
+# Windows: set full path to tesseract.exe here if nothing else finds it. Leave "" on macOS/Linux.
+TESSERACT_PATH = r""
+
+
+def _resolved_tesseract_cmd() -> str:
+    """
+    Resolve tesseract.exe for pytesseract: inline TESSERACT_PATH, env TESSERACT_CMD,
+    stonk_tesseract_path.txt (one line), common Windows install dirs, then PATH.
+    """
+    p0 = (TESSERACT_PATH or "").strip().strip('"')
+    if p0:
+        np = os.path.normpath(p0)
+        if os.path.isfile(np):
+            return np
+    env_v = (os.environ.get("TESSERACT_CMD") or "").strip().strip('"')
+    if env_v:
+        ne = os.path.normpath(env_v)
+        if os.path.isfile(ne):
+            return ne
+    try:
+        if os.path.isfile(TESSERACT_HINT_FILE):
+            with open(TESSERACT_HINT_FILE, encoding="utf-8", errors="ignore") as hf:
+                line = (hf.readline() or "").strip().strip('"')
+            if line:
+                nl = os.path.normpath(line)
+                if os.path.isfile(nl):
+                    return nl
+    except OSError:
+        pass
+    if platform.system() == "Windows":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pfx = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        for root in (
+            os.path.join(pf, "Tesseract-OCR"),
+            os.path.join(pfx, "Tesseract-OCR"),
+        ):
+            exe = os.path.join(root, "tesseract.exe")
+            if os.path.isfile(exe):
+                return exe
+        local = os.environ.get("LocalAppData", "")
+        if local:
+            exe = os.path.join(local, "Programs", "Tesseract-OCR", "tesseract.exe")
+            if os.path.isfile(exe):
+                return exe
+    w = shutil.which("tesseract")
+    if w:
+        nw = os.path.normpath(w)
+        if os.path.isfile(nw):
+            return nw
+    return ""
+
+
+TESSERACT_CMD = _resolved_tesseract_cmd()
 
 # ── Sell step definitions ─────────────────────────────────────────────────────
 SELL_STEPS = [
@@ -639,8 +693,8 @@ def ocr_extract_price(region: tuple) -> int:
     """
     if not HAS_OCR:
         raise RuntimeError("OCR libraries not installed. pip install pytesseract opencv-python Pillow")
-    if TESSERACT_PATH:
-        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    if TESSERACT_CMD:
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
     region = _normalize_region(region)
     left, top, width, height = region
@@ -710,8 +764,8 @@ def ocr_extract_result_value(region: tuple) -> int:
     """
     if not HAS_OCR:
         return 0
-    if TESSERACT_PATH:
-        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    if TESSERACT_CMD:
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
     try:
         left, top, width, height = _normalize_region(region)
         # Ignore left side where Robux icon can appear; read numeric text area.
@@ -752,8 +806,8 @@ def ocr_read_page_indicator(region: tuple) -> Tuple[Optional[int], Optional[int]
     """
     if not HAS_OCR:
         return (None, None)
-    if TESSERACT_PATH:
-        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    if TESSERACT_CMD:
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
     try:
         left, top, width, height = _normalize_region(region)
         screenshot = pyautogui.screenshot(region=(left, top, width, height))
@@ -872,6 +926,8 @@ def _collect_symbols_from_page(scan_region: tuple):
     """
     if not HAS_OCR:
         raise RuntimeError("OCR libs missing. Install: pytesseract opencv-python Pillow")
+    if TESSERACT_CMD:
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
     os.makedirs(SYMBOLS_DIR, exist_ok=True)
 
     left, top, width, height = _normalize_region(scan_region)
