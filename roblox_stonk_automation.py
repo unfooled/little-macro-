@@ -16,11 +16,10 @@ SETUP INSTRUCTIONS:
    - Windows: https://github.com/UB-Mannheim/tesseract/wiki
 
 4. One-time Roblox login (saves session cookies):
-   python roblox_stonk_automation.py --setup
-   (or: python setup_login.py)
+   python3 roblox_stonk_automation.py --setup
 
 5. Run the GUI:
-   python roblox_stonk_automation.py
+   python3 roblox_stonk_automation.py
 
 HOW TO USE:
 -----------
@@ -41,6 +40,7 @@ import platform
 import threading
 import subprocess
 import tkinter as tk
+from typing import Callable, Optional, Tuple
 from tkinter import ttk, messagebox
 
 # ── Auto-install pynput if missing ───────────────────────────────────────────
@@ -745,6 +745,50 @@ def ocr_extract_result_value(region: tuple) -> int:
         return 0
 
 
+def ocr_read_page_indicator(region: tuple) -> Tuple[Optional[int], Optional[int]]:
+    """
+    OCR a small UI area that shows current page vs total, e.g. "2 / 4" or "Page 2 of 4".
+    Returns (current_page, total_pages) or (None, None) if unreadable.
+    """
+    if not HAS_OCR:
+        return (None, None)
+    if TESSERACT_PATH:
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    try:
+        left, top, width, height = _normalize_region(region)
+        screenshot = pyautogui.screenshot(region=(left, top, width, height))
+        gray = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2GRAY)
+        up = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        th = cv2.threshold(up, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        pil_img = Image.fromarray(th)
+        raw = pytesseract.image_to_string(
+            pil_img,
+            config="--psm 6 -c tessedit_char_whitelist=0123456789/|OoFfPpAaEe ",
+        )
+        raw_n = re.sub(r"\s+", " ", (raw or "").strip())
+        if not raw_n:
+            return (None, None)
+        # "2 / 4" — allow OCR slash as | or l
+        m = re.search(r"(\d{1,3})\s*[/|lI]\s*(\d{1,3})", raw_n, re.I)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if 1 <= a <= 999 and 1 <= b <= 999:
+                return (a, b)
+        m = re.search(r"(?:page\s*)?(\d{1,3})\s+of\s+(\d{1,3})", raw_n, re.I)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if 1 <= a <= 999 and 1 <= b <= 999:
+                return (a, b)
+        nums = re.findall(r"\d{1,3}", raw_n)
+        if len(nums) >= 2:
+            a, b = int(nums[0]), int(nums[1])
+            if a <= b and 1 <= a <= 999 and 1 <= b <= 999:
+                return (a, b)
+    except Exception:
+        pass
+    return (None, None)
+
+
 # ============================================================
 # IN-GAME MOUSE CLICKS (using pynput for cross-platform support)
 # ============================================================
@@ -916,7 +960,8 @@ def detect_and_click_next_symbol(scan_region: tuple, completed: set, post_click_
 
 def run_one_cycle(coords: dict, ocr_region: tuple, scan_region: tuple, verify_region: tuple, universe_id: str,
                   post_click_wait: float, ocr_wait: float, click_delay_ms: int,
-                  completed_symbols: set, log_fn=None, should_continue=None):
+                  completed_symbols: set, log_fn=None, should_continue=None,
+                  no_symbol_nav: Optional[Callable[[], str]] = None):
     """
     One full sell cycle:
       1. Click game symbol
@@ -927,6 +972,10 @@ def run_one_cycle(coords: dict, ocr_region: tuple, scan_region: tuple, verify_re
       6. Create gamepass in browser
       7. Paste ID back into game
       8. Confirm
+
+    Returns (gamepass_id, price, symbol_name, nav_status) where nav_status is
+    "ok" | "next_page" | "cycle_end". If no_symbol_nav returns "cycle_end" when
+    the page has no pending symbols, next-page is not clicked.
     """
     def log(msg):
         print(msg)
@@ -958,8 +1007,17 @@ def run_one_cycle(coords: dict, ocr_region: tuple, scan_region: tuple, verify_re
         log(f"[GAME] Symbols on page: {', '.join(page_names)}")
     if not symbol_name:
         log("[GAME] All listed symbols on this page already done (or no new ones found).")
+        nav = "next"
+        if no_symbol_nav:
+            try:
+                nav = str(no_symbol_nav() or "next").lower()
+            except Exception:
+                nav = "next"
+        if nav == "cycle_end":
+            log("[GAME] End page reached — finishing cycle (no next-page click).")
+            return None, None, None, "cycle_end"
         click("next_page_btn")
-        return None, None, None
+        return None, None, None, "next_page"
     log(f"[GAME] Clicked symbol: {symbol_name}")
 
     log("[GAME] Clicking Sell button...")
@@ -1055,7 +1113,7 @@ def run_one_cycle(coords: dict, ocr_region: tuple, scan_region: tuple, verify_re
     sleep_check(0.5)
 
     log(f"✅ Cycle done! {symbol_name} -> Pass {gamepass_id} @ {price} Robux")
-    return gamepass_id, price, symbol_name
+    return gamepass_id, price, symbol_name, "ok"
 
 
 # ============================================================
@@ -1100,9 +1158,12 @@ class StonkAutomationApp:
         self._scan_tl        = None
         self._verify_step    = 0
         self._verify_tl      = None
+        self._page_ind_step  = 0
+        self._page_ind_tl    = None
         self._mouse_listener = None
         self.completed_symbols = set()
         self.current_page = 1
+        self.page_indicator_region = None  # optional OCR "2 / 4" area
         self.rotation_cfg = load_rotation_config()
         self.sale_universe_idx = 0
         self._last_hotkey_ts = {"toggle": 0.0, "stop": 0.0}
@@ -1140,6 +1201,8 @@ class StonkAutomationApp:
             self.verify_region = tuple(vr) if vr else None
             scan = coords_data.get("scan_region")
             self.scan_region = tuple(scan) if scan else None
+            pi = coords_data.get("page_indicator_region")
+            self.page_indicator_region = tuple(pi) if pi else None
             self._cfg = settings_data
         except Exception:
             pass
@@ -1154,6 +1217,8 @@ class StonkAutomationApp:
                 "click_ms":    self.click_ms_var.get(),
                 "loops":       self.loops_var.get(),
                 "start_delay": self.start_delay_var.get(),
+                "page_start":  int(self.page_start_var.get()),
+                "page_end":    int(self.page_end_var.get()),
             }, f, indent=2)
         with open(COORDS_FILE, "w") as f:
             json.dump({
@@ -1161,6 +1226,7 @@ class StonkAutomationApp:
                 "ocr_region":  list(self.ocr_region) if self.ocr_region else None,
                 "verify_region": list(self.verify_region) if self.verify_region else None,
                 "scan_region": list(self.scan_region) if self.scan_region else None,
+                "page_indicator_region": list(self.page_indicator_region) if self.page_indicator_region else None,
             }, f, indent=2)
         if not quiet and hasattr(self, "status_var"):
             self.status_var.set("💾 Config saved.")
@@ -1192,9 +1258,10 @@ class StonkAutomationApp:
 
     def reset_symbols_progress(self):
         self.completed_symbols = set()
-        self.current_page = 1
+        ps, _ = self._effective_page_bounds()
+        self.current_page = ps
         self._save_progress()
-        self.status_var.set("🧹 Symbol progress reset (starting from first symbols again).")
+        self.status_var.set(f"🧹 Symbol progress reset (page counter → start page {ps}).")
 
     def reset_all_gamepasses_offsale(self):
         if self.running:
@@ -1217,11 +1284,11 @@ class StonkAutomationApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _handle_cycle_completion(self, ui_log):
-        pages_per_cycle = max(1, int(self.rotation_cfg.get("pages_per_cycle", 12)))
         wait_seconds = max(0, int(self.rotation_cfg.get("cycle_wait_seconds", 3600)))
         universe_ids = self.rotation_cfg.get("offsale_universe_ids", [])
+        ps, pe = self._effective_page_bounds()
 
-        ui_log(f"[CYCLE] Reached {pages_per_cycle} pages. Resetting offsale stock...")
+        ui_log(f"[CYCLE] Finished page range (end page {pe}, start was {ps}). Resetting offsale stock...")
         for uid in universe_ids:
             if not self.running:
                 return
@@ -1231,13 +1298,13 @@ class StonkAutomationApp:
                 ui_log(f"[CYCLE] Offsale reset failed for {uid}: {e}")
 
         self.completed_symbols = set()
-        self.current_page = 1
+        self.current_page = ps
         self.sale_universe_idx = 0
         self._save_progress()
 
         if wait_seconds > 0 and self.running:
-            ui_log(f"[CYCLE] Waiting {wait_seconds}s before next cycle...")
-            self._interruptible_sleep(wait_seconds)
+            ui_log(f"[CYCLE] Waiting {wait_seconds}s before next cycle (anti-AFK every 15 min on outside-ID click if set)…")
+            self._interruptible_sleep_cycle_wait(wait_seconds, ui_log)
 
     def _sale_plan(self):
         ids = [str(x).strip() for x in self.rotation_cfg.get("offsale_universe_ids", []) if str(x).strip()]
@@ -1286,6 +1353,84 @@ class StonkAutomationApp:
         if not selected:
             raise RuntimeError("All universes still full after reset/wait cycle.")
         return selected
+
+    def _effective_page_bounds(self):
+        ps = max(1, int(self.page_start_var.get()))
+        pe = max(ps, int(self.page_end_var.get()))
+        return ps, pe
+
+    def _no_symbol_nav(self) -> str:
+        _, pe = self._effective_page_bounds()
+        if self.current_page >= pe:
+            return "cycle_end"
+        return "next"
+
+    def _read_page_indicator_tuple(self) -> Tuple[Optional[int], Optional[int]]:
+        if not self.page_indicator_region:
+            return (None, None)
+        try:
+            return ocr_read_page_indicator(self.page_indicator_region)
+        except Exception:
+            return (None, None)
+
+    def _sync_current_page_from_indicator(self, ui_log=None):
+        cur, _tot = self._read_page_indicator_tuple()
+        if cur is not None:
+            self.current_page = cur
+            if ui_log:
+                ui_log(f"[PAGE] OCR page indicator → page {self.current_page}")
+
+    def _ensure_page_start(self, ui_log):
+        ps, pe = self._effective_page_bounds()
+        if self.current_page > pe:
+            ui_log(f"[PAGE] Saved page {self.current_page} > end {pe}; clamping to start {ps}.")
+            self.current_page = ps
+            self._save_progress()
+            return
+        if ps <= 1:
+            self._sync_current_page_from_indicator(ui_log)
+            return
+        post_w = max(0.05, float(self.post_click_wait_var.get()))
+        click_ms = int(self.click_ms_var.get())
+        for _ in range(48):
+            if not self.running:
+                return
+            self._sync_current_page_from_indicator(None)
+            if self.current_page >= ps:
+                ui_log(f"[PAGE] At start page ≥ {ps} (current {self.current_page}).")
+                return
+            cur, _ = self._read_page_indicator_tuple()
+            if cur is not None and cur >= ps:
+                self.current_page = cur
+                self._save_progress()
+                ui_log(f"[PAGE] OCR shows page {cur} — start range satisfied.")
+                return
+            ui_log(f"[PAGE] Advancing toward start page {ps} (from {self.current_page})…")
+            x, y = self.coords["next_page_btn"]
+            _mouse_click(x, y, click_ms)
+            time.sleep(post_w)
+            self.current_page += 1
+            self._sync_current_page_from_indicator(ui_log)
+            self._save_progress()
+        ui_log("[PAGE] Could not reach start page in 48 next-clicks; continuing anyway.")
+
+    def _interruptible_sleep_cycle_wait(self, seconds: int, ui_log):
+        """Long post-cycle wait with periodic anti-AFK click (same spot as ID commit)."""
+        end = time.time() + max(0, int(seconds))
+        next_afk = time.time() + 900.0  # 15 minutes
+        click_ms = int(self.click_ms_var.get())
+        commit = self.coords.get("id_commit_click")
+        while self.running and time.time() < end:
+            if time.time() >= next_afk and commit:
+                try:
+                    bring_roblox_to_foreground()
+                    time.sleep(0.35)
+                    _mouse_click(int(commit[0]), int(commit[1]), click_ms)
+                    ui_log("[CYCLE] Anti-AFK: clicked outside ID box (15 min).")
+                except Exception as ex:
+                    ui_log(f"[CYCLE] Anti-AFK click failed: {ex}")
+                next_afk = time.time() + 900.0
+            time.sleep(0.05)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -1408,6 +1553,45 @@ class StonkAutomationApp:
         tk.Label(scan_outer,
                  text="Click top-left and bottom-right of the visible symbols area. Script will click symbols from images in symbols/.",
                  font=FONT_SM, fg=MUTED, bg=BG, wraplength=480, justify="left").pack(anchor="w", pady=(4, 0))
+
+        tk.Frame(main, bg=MUTED, height=1).pack(fill="x", pady=(6, 0))
+        page_outer = tk.Frame(main, bg=BG, padx=18, pady=10)
+        page_outer.pack(fill="x")
+        tk.Label(page_outer, text="PAGE RANGE & NEXT-PAGE INDICATOR (optional)", font=FONT_SM,
+                 fg=MUTED, bg=BG).pack(anchor="w", pady=(0, 6))
+        cfg_pages = getattr(self, "_cfg", {})
+        _ppc_default = max(1, int(self.rotation_cfg.get("pages_per_cycle", 12)))
+        self.page_start_var = tk.IntVar(value=int(cfg_pages.get("page_start", 1)))
+        self.page_end_var = tk.IntVar(value=int(cfg_pages.get("page_end", _ppc_default)))
+        page_row = tk.Frame(page_outer, bg=CARD, padx=12, pady=8)
+        page_row.pack(fill="x")
+
+        def _labeled_page_spin(parent, label, var, lo, hi):
+            f = tk.Frame(parent, bg=CARD, padx=8, pady=4)
+            f.pack(side="left", padx=(0, 10))
+            tk.Label(f, text=label, font=FONT_SM, fg=MUTED, bg=CARD).pack(anchor="w")
+            tk.Spinbox(f, textvariable=var, from_=lo, to=hi, increment=1, width=5, font=FONT,
+                       bg=BTN_BG, fg=ACCENT, buttonbackground=BTN_BG, relief="flat",
+                       insertbackground=ACCENT).pack()
+
+        _labeled_page_spin(page_row, "Start page (1 = first)", self.page_start_var, 1, 99)
+        _labeled_page_spin(page_row, "End page (inclusive)", self.page_end_var, 1, 99)
+
+        ind_row = tk.Frame(page_outer, bg=CARD, padx=12, pady=8)
+        ind_row.pack(fill="x", pady=(6, 0))
+        self.page_indicator_region_var = tk.StringVar(value=self._page_ind_str())
+        tk.Label(ind_row, textvariable=self.page_indicator_region_var,
+                 font=FONT_SM, fg=ACCENT, bg=CARD, width=32, anchor="w").pack(side="left", padx=(0, 10))
+        tk.Button(ind_row, text="📄 PICK PAGE TEXT REGION", font=FONT_SM, bg=BTN_BG, fg=ACCENT,
+                  activebackground=ACCENT, activeforeground=BG, relief="flat", padx=10, pady=3,
+                  cursor="hand2", command=self.start_page_indicator_pick).pack(side="left", padx=(0, 6))
+        tk.Button(ind_row, text="✕", font=FONT_SM, bg=BTN_BG, fg=ACCENT2,
+                  activebackground=ACCENT2, activeforeground=BG, relief="flat", padx=8, pady=3,
+                  cursor="hand2", command=self.clear_page_indicator_region).pack(side="left")
+        tk.Label(page_outer,
+                 text="Calibrate the small “2 / 4” (current / total) text under next-page if shown. "
+                      "Leave unset to track pages by next-clicks only. End page stops the cycle without clicking next again.",
+                 font=FONT_SM, fg=MUTED, bg=BG, wraplength=520, justify="left").pack(anchor="w", pady=(4, 0))
 
         # ── Sell steps ────────────────────────────────────────────────────────
         tk.Frame(main, bg=MUTED, height=1).pack(fill="x", pady=(6, 0))
@@ -1549,7 +1733,8 @@ class StonkAutomationApp:
         self.pick_overlay = None
 
         # Autosave on editable values
-        for var in (self.universe_var, self.post_click_wait_var, self.proc_delay_var, self.click_ms_var, self.loops_var, self.start_delay_var):
+        for var in (self.universe_var, self.post_click_wait_var, self.proc_delay_var, self.click_ms_var, self.loops_var, self.start_delay_var,
+                    self.page_start_var, self.page_end_var):
             var.trace_add("write", lambda *_: self._auto_save_config())
 
     # ── Hotkeys ───────────────────────────────────────────────────────────────
@@ -1642,7 +1827,7 @@ class StonkAutomationApp:
         self._track_mouse_pos()
 
     def _track_mouse_pos(self):
-        if (self.picking or self._region_step > 0 or self._verify_step > 0 or self._scan_step > 0) and \
+        if (self.picking or self._region_step > 0 or self._verify_step > 0 or self._scan_step > 0 or self._page_ind_step > 0) and \
                 self.pick_overlay and self.pick_overlay.winfo_exists():
             x, y = pyautogui.position()
             self.status_var.set(f"Mouse at ({x}, {y})  |  Click = confirm   Esc = cancel")
@@ -1685,6 +1870,8 @@ class StonkAutomationApp:
         self._verify_tl    = None
         self._scan_step    = 0
         self._scan_tl      = None
+        self._page_ind_step = 0
+        self._page_ind_tl   = None
         self.status_var.set("Pick cancelled.")
         self._close_overlay()
 
@@ -1870,6 +2057,64 @@ class StonkAutomationApp:
             self._close_overlay()
             self._auto_save_config()
 
+    def _page_ind_str(self):
+        if not self.page_indicator_region:
+            return "not set"
+        l, t, w, h = self.page_indicator_region
+        return f"({l}, {t})  →  ({l+w}, {t+h})  [{w}×{h}]"
+
+    def clear_page_indicator_region(self):
+        self.page_indicator_region = None
+        self.page_indicator_region_var.set("not set")
+        self._auto_save_config()
+
+    def start_page_indicator_pick(self):
+        if self.running:
+            messagebox.showwarning("Stonk Bot", "Stop the script before picking a region.")
+            return
+        self._page_ind_step = 1
+        self._page_ind_tl = None
+        self._show_overlay("📄 Click TOP-LEFT of the “current / total” page text   |   Esc to cancel")
+        self.root.after(400, self._start_mouse_listener_page_ind)
+
+    def _start_mouse_listener_page_ind(self):
+        from pynput import mouse as pm
+        if self._mouse_listener:
+            try:
+                self._mouse_listener.stop()
+            except Exception:
+                pass
+
+        def on_click(x, y, button, pressed):
+            if pressed and button == pm.Button.left and self._page_ind_step > 0:
+                self.root.after(0, lambda cx=x, cy=y: self._page_ind_click(cx, cy))
+                return False
+
+        self._mouse_listener = pm.Listener(on_click=on_click)
+        self._mouse_listener.daemon = True
+        self._mouse_listener.start()
+
+    def _page_ind_click(self, x, y):
+        if self._page_ind_step == 1:
+            self._page_ind_tl = (x, y)
+            self._page_ind_step = 2
+            self._show_overlay("📄 Now click BOTTOM-RIGHT of the page text region   |   Esc to cancel")
+            self.root.after(400, self._start_mouse_listener_page_ind)
+            return
+        if self._page_ind_step == 2:
+            tl = self._page_ind_tl
+            left = min(tl[0], x)
+            top = min(tl[1], y)
+            width = abs(x - tl[0])
+            height = abs(y - tl[1])
+            self.page_indicator_region = (left, top, width, height)
+            self.page_indicator_region_var.set(self._page_ind_str())
+            self.status_var.set(f"✓ Page indicator region: {self._page_ind_str()}")
+            self._page_ind_step = 0
+            self._page_ind_tl = None
+            self._close_overlay()
+            self._auto_save_config()
+
     # ── Run control ───────────────────────────────────────────────────────────
 
     def emergency_stop(self):
@@ -1977,7 +2222,10 @@ class StonkAutomationApp:
                 if not selected_universe_id:
                     self.running = False
                     break
-                gamepass_id, price, symbol_name = run_one_cycle(
+                self._ensure_page_start(ui_log)
+                if not self.running:
+                    break
+                gamepass_id, price, symbol_name, nav = run_one_cycle(
                     coords       = self.coords,
                     ocr_region   = self.ocr_region,
                     verify_region = self.verify_region,
@@ -1989,16 +2237,18 @@ class StonkAutomationApp:
                     completed_symbols = self.completed_symbols,
                     log_fn       = ui_log,
                     should_continue = lambda: self.running,
+                    no_symbol_nav = self._no_symbol_nav,
                 )
                 if symbol_name:
                     self.completed_symbols.add(symbol_name)
                     self._save_progress()
                 else:
-                    self.current_page += 1
-                    self._save_progress()
-                    pages_per_cycle = max(1, int(self.rotation_cfg.get("pages_per_cycle", 12)))
-                    if self.current_page > pages_per_cycle:
+                    if nav == "cycle_end":
                         self._handle_cycle_completion(ui_log)
+                    elif nav == "next_page":
+                        self.current_page += 1
+                        self._sync_current_page_from_indicator(ui_log)
+                        self._save_progress()
             except Exception as e:
                 if str(e) == "Stopped":
                     self.running = False
