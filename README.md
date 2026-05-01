@@ -61,6 +61,20 @@ playwright install chromium
 - Grant **Accessibility** (and if needed **Input Monitoring**) to Terminal / Python so mouse/keyboard automation works.
 - Use `python` or `py` as appropriate on your PC.
 
+## Page range, page indicator, and anti-AFK (optional)
+
+The GUI can limit which symbol pages you visit (**Start page** / **End page**, inclusive) and optionally OCR the small “current / total” text next to pagination. After a full cycle, the long wait (`cycle_wait_seconds` in `stonk_rotation_config.json`, often 1 hour) triggers a **click on “outside ID box”** every **15 minutes** so Roblox does not idle-kick you.
+
+**What to update on your machine (not in git):**
+
+| File | What to add or check |
+|------|----------------------|
+| `stonk_settings.json` | `page_start` and `page_end` (integers). If missing, the app defaults start to `1` and end to `pages_per_cycle` from rotation config. |
+| `stonk_coordinates.json` | Optional `page_indicator_region`: `[left, top, width, height]` for the “2 / 4” style text. Omit if you only rely on click-counting. |
+| Coordinates in the GUI | **⑤ Click Outside ID Box** must be set for anti-AFK clicks during the long wait. |
+
+Re-open the GUI after editing JSON, or use **Save Config** so values stay in sync.
+
 ## Publishing to GitHub
 
 Do **not** commit `roblox_cookies.json` or personal coordinates if you prefer; they are listed in `.gitignore`. Commit:
