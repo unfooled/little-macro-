@@ -7,7 +7,21 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")  # or paste your webhook here
+def load_webhook():
+    if os.path.exists("webhook.txt"):
+        with open("webhook.txt", "r") as f:
+            url = f.read().strip()
+            if url:
+                print("🔗 Webhook loaded from webhook.txt")
+                return url
+    url = os.getenv("DISCORD_WEBHOOK", "")
+    if url:
+        print("🔗 Webhook loaded from environment variable")
+    else:
+        print("⚠️ No webhook found, running without Discord notifications")
+    return url
+
+DISCORD_WEBHOOK = load_webhook()
 
 NUM_THREADS  = 2
 BATCH_SIZE   = 300
